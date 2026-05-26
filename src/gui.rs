@@ -1,4 +1,5 @@
 use crate::browser_discovery::get_browser_name_from_path;
+use copypasta::{ClipboardContext, ClipboardProvider};
 use log::{error, warn};
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 use std::collections::HashMap;
@@ -9,21 +10,23 @@ const BROWSER_CHOOSER_REMEMBER_CHOICE: &str = "Remember this choice for this sit
 const BROWSER_CHOOSER_CANCEL: &str = "Cancel";
 
 slint::slint! {
-    import { Button, CheckBox, VerticalBox } from "std-widgets.slint";
+    import { Button, CheckBox, HorizontalBox, ScrollView, VerticalBox } from "std-widgets.slint";
 
     export component BrowserChooserDialog inherits Window {
         in property <string> window_title;
         in property <string> prompt_text;
         in property <string> remember_choice_text;
         in property <string> cancel_text;
+        in property <string> copy_url_text;
         in property <string> url;
         in property <[string]> browsers;
         in-out property <bool> remember_choice: false;
         callback browser_selected(int, bool);
+        callback copy_url();
         callback cancel();
 
         width: 520px;
-        height: 380px;
+        preferred-height: 480px;
         title: root.window_title;
 
         VerticalBox {
@@ -36,18 +39,28 @@ slint::slint! {
                 wrap: word-wrap;
             }
 
-            Text {
-                text: root.url;
-                color: #666666;
-                wrap: word-wrap;
+            Rectangle {
+                height: 40px;
+                clip: true;
+                Text {
+                    text: root.url;
+                    color: #888888;
+                    wrap: no-wrap;
+                    overflow: elide;
+                    width: parent.width;
+                }
             }
 
-            VerticalBox {
-                spacing: 8px;
+            ScrollView {
+                vertical-scrollbar-policy: as-needed;
+                preferred-height: 220px;
+                VerticalBox {
+                    spacing: 8px;
 
-                for browser[i] in root.browsers : Button {
-                    text: browser;
-                    clicked => { root.browser_selected(i, root.remember_choice); }
+                    for browser[i] in root.browsers : Button {
+                        text: browser;
+                        clicked => { root.browser_selected(i, root.remember_choice); }
+                    }
                 }
             }
 
@@ -56,9 +69,16 @@ slint::slint! {
                 checked <=> root.remember_choice;
             }
 
-            Button {
-                text: root.cancel_text;
-                clicked => { root.cancel(); }
+            HorizontalBox {
+                spacing: 8px;
+                Button {
+                    text: root.copy_url_text;
+                    clicked => { root.copy_url(); }
+                }
+                Button {
+                    text: root.cancel_text;
+                    clicked => { root.cancel(); }
+                }
             }
         }
     }
@@ -86,6 +106,7 @@ pub fn prompt_browser_selection_slint(url: &str, browsers: &[String]) -> GuiChoo
     dialog.set_prompt_text(SharedString::from(BROWSER_CHOOSER_PROMPT));
     dialog.set_remember_choice_text(SharedString::from(BROWSER_CHOOSER_REMEMBER_CHOICE));
     dialog.set_cancel_text(SharedString::from(BROWSER_CHOOSER_CANCEL));
+    dialog.set_copy_url_text(SharedString::from("Copy URL"));
 
     let browser_names: Vec<SharedString> = browser_display_names(browsers)
         .into_iter()
@@ -123,6 +144,20 @@ pub fn prompt_browser_selection_slint(url: &str, browsers: &[String]) -> GuiChoo
 
             if let Some(dialog) = weak.upgrade() {
                 let _ = dialog.hide();
+            }
+        });
+    }
+
+    {
+        let url = url.to_string();
+        dialog.on_copy_url(move || match ClipboardContext::new() {
+            Ok(mut clipboard) => {
+                if let Err(e) = clipboard.set_contents(url.clone()) {
+                    warn!("Failed to copy URL to clipboard: {}", e);
+                }
+            }
+            Err(e) => {
+                warn!("Failed to access clipboard: {}", e);
             }
         });
     }
@@ -166,11 +201,18 @@ fn browser_display_names(browsers: &[String]) -> Vec<String> {
         .iter()
         .zip(derived_names)
         .map(|(browser_path, browser_name)| {
-            if counts.get(browser_name.as_str()).copied().unwrap_or(0) > 1 {
-                format!("{} ({})", browser_name, browser_path)
+            let browser_key = browser_name.clone();
+            let mut display_name = if browser_path.starts_with("flatpak:") {
+                format!("{} (Flatpak)", browser_name)
             } else {
                 browser_name
+            };
+
+            if counts.get(browser_key.as_str()).copied().unwrap_or(0) > 1 {
+                display_name = format!("{} ({})", display_name, browser_path);
             }
+
+            display_name
         })
         .collect()
 }

@@ -385,7 +385,7 @@ fn handle_url_open(url: String) {
 
     if let Some(browser_path) = matched_browser_path {
         info!("Launching browser: {} with URL: {}", browser_path, url);
-        match Command::new(browser_path).arg(&url).spawn() {
+        match spawn_browser_process(&browser_path, &url) {
             Ok(_) => info!("Browser launched successfully."),
             Err(e) => error!("Failed to launch browser: {}", e),
         }
@@ -417,7 +417,7 @@ fn handle_url_open(url: String) {
                             "No interactive terminal is available. Opening the URL in {}.",
                             get_browser_name_from_path(&browser_path)
                         );
-                        match Command::new(browser_path).arg(&url).spawn() {
+                        match spawn_browser_process(&browser_path, &url) {
                             Ok(_) => info!("Fallback browser launched successfully."),
                             Err(e) => error!("Failed to launch fallback browser: {}", e),
                         }
@@ -452,7 +452,7 @@ fn handle_url_open(url: String) {
                             "No input was received. Opening the URL in {}.",
                             get_browser_name_from_path(&browser_path)
                         );
-                        match Command::new(browser_path).arg(&url).spawn() {
+                        match spawn_browser_process(&browser_path, &url) {
                             Ok(_) => info!("Fallback browser launched successfully."),
                             Err(e) => error!("Failed to launch fallback browser: {}", e),
                         }
@@ -484,7 +484,7 @@ fn handle_url_open(url: String) {
                             "Launching selected browser: {} with URL: {}",
                             selected_browser_path, url
                         );
-                        match Command::new(selected_browser_path).arg(url.clone()).spawn() {
+                        match spawn_browser_process(selected_browser_path, &url) {
                             Ok(_) => {
                                 info!("Browser launched successfully.");
 
@@ -530,7 +530,7 @@ fn launch_browser_with_optional_rule(url: &str, browser_path: &str, save_rule: b
         "Launching selected browser: {} with URL: {}",
         browser_path, url
     );
-    match Command::new(browser_path).arg(url).spawn() {
+    match spawn_browser_process(browser_path, url) {
         Ok(_) => {
             info!("Browser launched successfully.");
 
@@ -553,6 +553,19 @@ fn launch_browser_with_optional_rule(url: &str, browser_path: &str, save_rule: b
             }
         }
         Err(e) => error!("Failed to launch browser: {}", e),
+    }
+}
+
+fn spawn_browser_process(browser_spec: &str, url: &str) -> Result<(), std::io::Error> {
+    if let Some(app_id) = browser_spec.strip_prefix("flatpak:") {
+        Command::new("flatpak")
+            .arg("run")
+            .arg(app_id)
+            .arg(url)
+            .spawn()
+            .map(|_| ())
+    } else {
+        Command::new(browser_spec).arg(url).spawn().map(|_| ())
     }
 }
 

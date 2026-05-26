@@ -108,6 +108,55 @@ fn cleanup_mimeapps_defaults(desktop_id: &str) -> io::Result<bool> {
     Ok(changed_any)
 }
 
+fn is_flatpak_browser_id(app_id: &str) -> bool {
+    let lower = app_id.to_ascii_lowercase();
+    let known_app_ids = [
+        "org.mozilla.firefox",
+        "org.mozilla.firefox.developeredition",
+        "org.mozilla.firefox.esr",
+        "org.chromium.Chromium",
+        "com.github.brave.Brave",
+        "com.microsoft.Edge",
+        "com.microsoft.EdgeDev",
+        "com.microsoft.EdgeBeta",
+        "com.operasoftware.Opera",
+        "com.vivaldi.Vivaldi",
+        "org.librewolf-community.LibreWolf",
+    ];
+
+    known_app_ids.contains(&app_id)
+        || lower.contains("firefox")
+        || lower.contains("chromium")
+        || lower.contains("brave")
+        || lower.contains("microsoft.edge")
+        || lower.contains("edge")
+        || lower.contains("opera")
+        || lower.contains("vivaldi")
+        || lower.contains("librewolf")
+}
+
+fn parse_flatpak_browser_list(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|app_id| is_flatpak_browser_id(app_id))
+        .map(|app_id| format!("flatpak:{}", app_id))
+        .collect()
+}
+
+fn detect_flatpak_browsers() -> Vec<String> {
+    if let Ok(output) = Command::new("flatpak")
+        .args(["list", "--app", "--columns=application"])
+        .output()
+        && output.status.success()
+    {
+        return parse_flatpak_browser_list(&String::from_utf8_lossy(&output.stdout));
+    }
+
+    Vec::new()
+}
+
 fn detect_system_mimeapps_references(desktop_id: &str) -> Vec<String> {
     let candidates = [
         "/etc/xdg/mimeapps.list",
@@ -146,6 +195,10 @@ impl PlatformHandler for LinuxHandler {
             "vivaldi",
             "thorium-browser",
             "floorp",
+            "microsoft-edge",
+            "microsoft-edge-stable",
+            "microsoft-edge-dev",
+            "microsoft-edge-beta",
         ];
 
         for cmd in &browser_commands {
@@ -174,10 +227,14 @@ impl PlatformHandler for LinuxHandler {
             "/usr/bin/vivaldi",
             "/usr/bin/thorium-browser",
             "/usr/bin/floorp",
+            "/usr/bin/microsoft-edge",
+            "/usr/bin/microsoft-edge-stable",
+            "/usr/bin/microsoft-edge-dev",
             "/opt/google/chrome/chrome",
             "/opt/brave.com/brave/brave",
             "/opt/opera/opera",
             "/opt/vivaldi/vivaldi",
+            "/opt/microsoft/msedge/msedge",
         ];
 
         for path in &common_paths {
@@ -186,7 +243,29 @@ impl PlatformHandler for LinuxHandler {
             }
         }
 
-        browsers.into_iter().collect()
+        for flatpak_browser in detect_flatpak_browsers() {
+            browsers.insert(flatpak_browser);
+        }
+
+        // Deduplicate native entries that resolve to the same display name,
+        // while keeping all Flatpak entries (they are already unique by app ID).
+        let mut all_paths: Vec<String> = browsers.into_iter().collect();
+        all_paths.sort();
+
+        let mut seen_names: HashSet<String> = HashSet::new();
+        let mut deduped: Vec<String> = Vec::new();
+        for path in all_paths {
+            if path.starts_with("flatpak:") {
+                deduped.push(path);
+            } else {
+                let name = crate::browser_discovery::get_browser_name_from_path(&path);
+                if seen_names.insert(name) {
+                    deduped.push(path);
+                }
+            }
+        }
+
+        deduped
     }
 
     fn set_as_default_handler(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -491,7 +570,9 @@ impl PlatformHandler for LinuxHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::{purge_desktop_entry_from_mimeapps, render_desktop_entry};
+    use super::{
+        parse_flatpak_browser_list, purge_desktop_entry_from_mimeapps, render_desktop_entry,
+    };
 
     #[test]
     fn desktop_entry_uses_unquoted_exec_path() {
@@ -500,6 +581,21 @@ mod tests {
         assert!(desktop_entry.contains("Exec=/tmp/rust browser handler %u"));
         assert!(!desktop_entry.contains("Exec=\"/tmp/rust browser handler\" %u"));
         assert!(!desktop_entry.contains("@EXECUTABLE@"));
+    }
+
+    #[test]
+    fn parse_flatpak_browser_list_outputs_known_browsers() {
+        let output = "org.mozilla.firefox\norg.chromium.Chromium\ncom.spotify.Client\ncom.github.brave.Brave\n";
+        let parsed = parse_flatpak_browser_list(output);
+
+        assert_eq!(
+            parsed,
+            vec![
+                "flatpak:org.mozilla.firefox".to_string(),
+                "flatpak:org.chromium.Chromium".to_string(),
+                "flatpak:com.github.brave.Brave".to_string(),
+            ]
+        );
     }
 
     #[test]

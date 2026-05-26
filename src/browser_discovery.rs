@@ -19,12 +19,51 @@ pub fn get_browser_map() -> &'static HashMap<&'static str, &'static str> {
         m.insert("vivaldi", "Vivaldi");
         m.insert("thorium-browser", "Thorium");
         m.insert("floorp", "Floorp");
+        m.insert("microsoft-edge", "Microsoft Edge");
+        m.insert("microsoft-edge-stable", "Microsoft Edge");
+        m.insert("microsoft-edge-dev", "Microsoft Edge");
+        m.insert("microsoft-edge-beta", "Microsoft Edge");
+        m.insert("msedge", "Microsoft Edge");
+        m.insert("brave", "Brave");
+        m.insert("brave-stable", "Brave");
+        m.insert("google-chrome", "Google Chrome");
+        m.insert("google-chrome-stable", "Google Chrome");
         m
     })
 }
 
+fn get_flatpak_browser_name(app_id: &str) -> String {
+    let lower = app_id.to_ascii_lowercase();
+    if lower.contains("firefox") {
+        if lower.contains("developeredition") {
+            "Mozilla Firefox Developer Edition".to_string()
+        } else if lower.contains("esr") {
+            "Mozilla Firefox ESR".to_string()
+        } else {
+            "Mozilla Firefox".to_string()
+        }
+    } else if lower.contains("chromium") {
+        "Chromium".to_string()
+    } else if lower.contains("brave") {
+        "Brave".to_string()
+    } else if lower.contains("microsoft.edge") || lower.contains("edge") {
+        "Microsoft Edge".to_string()
+    } else if lower.contains("vivaldi") {
+        "Vivaldi".to_string()
+    } else if lower.contains("opera") {
+        "Opera".to_string()
+    } else if lower.contains("librewolf") {
+        "LibreWolf".to_string()
+    } else {
+        app_id.to_string()
+    }
+}
+
 /// Gets a displayable browser name from its path using the official name if possible
 pub fn get_browser_name_from_path(path: &str) -> String {
+    if let Some(app_id) = path.strip_prefix("flatpak:") {
+        return get_flatpak_browser_name(app_id);
+    }
     Path::new(path)
         .file_name()
         .and_then(|name| name.to_str())

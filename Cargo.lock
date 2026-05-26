@@ -3299,6 +3299,7 @@ name = "rust_browser_handler"
 version = "0.3.0"
 dependencies = [
  "clap",
+ "copypasta",
  "dirs",
  "env_logger",
  "fontique",
