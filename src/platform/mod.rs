@@ -6,6 +6,14 @@ pub trait PlatformHandler {
     fn unregister_handler(&self) -> Result<(), Box<dyn Error>>;
     #[allow(dead_code)]
     fn is_default_handler(&self) -> bool;
+
+    /// Returns the OS-configured default browser's path (in the same format
+    /// `find_browsers` uses), so it can be floated to the top of the
+    /// selection list. `None` when it can't be determined, or when the
+    /// default is this handler itself.
+    fn default_browser_path(&self) -> Option<String> {
+        None
+    }
 }
 
 #[cfg(windows)]

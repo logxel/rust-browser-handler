@@ -157,6 +157,84 @@ fn detect_flatpak_browsers() -> Vec<String> {
     Vec::new()
 }
 
+/// Extracts the launch command from a desktop entry's `Exec=` line, resolving
+/// it to the same path format `find_browsers` produces: a flatpak
+/// application ID (as `flatpak:<app-id>`) when the entry launches one, or an
+/// absolute, normalized executable path otherwise.
+fn resolve_exec_line(exec_value: &str) -> Option<String> {
+    // Desktop entry Exec fields can carry %u/%f-style field codes; only the
+    // command and its non-placeholder arguments matter here.
+    let tokens: Vec<&str> = exec_value
+        .split_whitespace()
+        .filter(|t| !t.starts_with('%'))
+        .collect();
+
+    let first = *tokens.first()?;
+    let first_basename = Path::new(first).file_name().and_then(|n| n.to_str())?;
+
+    if first_basename == "flatpak" {
+        let app_id = tokens
+            .iter()
+            .skip_while(|t| **t != "run")
+            .nth(1)
+            .filter(|t| !t.starts_with('-'))?;
+        return Some(format!("flatpak:{app_id}"));
+    }
+
+    resolve_command_to_path(first)
+}
+
+fn resolve_command_to_path(cmd: &str) -> Option<String> {
+    let path = Path::new(cmd);
+    if path.is_absolute() {
+        return if path.exists() {
+            Some(crate::browser_discovery::normalize_path(cmd))
+        } else {
+            None
+        };
+    }
+
+    let output = Command::new("which").arg(cmd).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let resolved = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    if resolved.is_empty() {
+        None
+    } else {
+        Some(crate::browser_discovery::normalize_path(&resolved))
+    }
+}
+
+/// Resolves a `.desktop` file ID (as returned by `xdg-mime query default`)
+/// to a launchable path by searching the standard XDG application
+/// directories, including Flatpak's exports, for the matching entry.
+fn resolve_desktop_entry_exec(desktop_id: &str) -> Option<String> {
+    let mut search_dirs = Vec::new();
+    if let Some(data_dir) = dirs::data_dir() {
+        search_dirs.push(data_dir.join("applications"));
+        search_dirs.push(data_dir.join("flatpak/exports/share/applications"));
+    }
+    search_dirs.push(Path::new("/usr/local/share/applications").to_path_buf());
+    search_dirs.push(Path::new("/usr/share/applications").to_path_buf());
+    search_dirs.push(Path::new("/var/lib/flatpak/exports/share/applications").to_path_buf());
+
+    for dir in search_dirs {
+        let content = match fs::read_to_string(dir.join(desktop_id)) {
+            Ok(content) => content,
+            Err(_) => continue,
+        };
+        let Some(exec_line) = content.lines().find(|l| l.starts_with("Exec=")) else {
+            continue;
+        };
+        if let Some(resolved) = resolve_exec_line(exec_line.trim_start_matches("Exec=").trim()) {
+            return Some(resolved);
+        }
+    }
+
+    None
+}
+
 fn detect_system_mimeapps_references(desktop_id: &str) -> Vec<String> {
     let candidates = [
         "/etc/xdg/mimeapps.list",
@@ -565,6 +643,31 @@ impl PlatformHandler for LinuxHandler {
         }
 
         false
+    }
+
+    fn default_browser_path(&self) -> Option<String> {
+        let query_default = |mime_type: &str| -> Option<String> {
+            let output = Command::new("xdg-mime")
+                .args(["query", "default", mime_type])
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let value = String::from_utf8(output.stdout).ok()?.trim().to_string();
+            if value.is_empty() { None } else { Some(value) }
+        };
+
+        let desktop_id = query_default("x-scheme-handler/https")
+            .or_else(|| query_default("x-scheme-handler/http"))?;
+
+        // If we're already the registered default, there's nothing useful to
+        // float to the top over the rest of the detected browsers.
+        if desktop_id == "rust-browser-handler.desktop" {
+            return None;
+        }
+
+        resolve_desktop_entry_exec(&desktop_id)
     }
 }
 

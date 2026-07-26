@@ -316,6 +316,48 @@ impl PlatformHandler for WindowsHandler {
         }
         false
     }
+
+    fn default_browser_path(&self) -> Option<String> {
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+
+        // Modern Windows records the user's browser choice as a ProgId under
+        // the documented UrlAssociations\<scheme>\UserChoice key.
+        let prog_id = hkcu
+            .open_subkey(
+                "Software\\Microsoft\\Windows\\CurrentVersion\\UrlAssociations\\https\\UserChoice",
+            )
+            .or_else(|_| {
+                hkcu.open_subkey(
+                    "Software\\Microsoft\\Windows\\CurrentVersion\\UrlAssociations\\http\\UserChoice",
+                )
+            })
+            .ok()
+            .and_then(|key| key.get_value::<String, _>("ProgId").ok())?;
+
+        if prog_id.eq_ignore_ascii_case(PROG_ID) {
+            // We're already the registered default; nothing to float to the top.
+            return None;
+        }
+
+        let command = hkcu
+            .open_subkey(format!(
+                "Software\\Classes\\{prog_id}\\shell\\open\\command"
+            ))
+            .ok()
+            .and_then(|key| key.get_value::<String, _>("").ok())
+            .or_else(|| {
+                RegKey::predef(HKEY_CLASSES_ROOT)
+                    .open_subkey(format!("{prog_id}\\shell\\open\\command"))
+                    .ok()
+                    .and_then(|key| key.get_value::<String, _>("").ok())
+            })?;
+
+        let exe_path = extract_executable_path_from_command(command)?;
+        if exe_path.is_empty() {
+            return None;
+        }
+        Some(crate::browser_discovery::normalize_path(&exe_path))
+    }
 }
 
 /// Generate possible Windows paths for browser executables
