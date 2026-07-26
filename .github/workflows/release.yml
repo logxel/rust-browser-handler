@@ -59,9 +59,29 @@ jobs:
 
           should_build="true"
           if [[ "${http_code}" == "200" ]]; then
+            check_assets_script="${RUNNER_TEMP}/check_release_assets.py"
+            cat <<'PY' > "${check_assets_script}"
+          import json
+          import os
+          import sys
+
+          with open(os.environ["RELEASE_JSON_PATH"], "r", encoding="utf-8") as f:
+              data = json.load(f)
+
+          assets = {a.get("name") for a in data.get("assets", [])}
+          required = {"rust_browser_handler_windows.zip", "rust_browser_handler_linux.tar.gz"}
+          missing = required - assets
+
+          if missing:
+              sys.stderr.write(f"Missing release assets: {sorted(missing)}\n")
+              sys.exit(1)
+
+          sys.exit(0)
+          PY
+
             # Python exit code drives shell branching:
             # 0 => assets complete (skip build), 1 => assets missing (build needed).
-            if RELEASE_JSON_PATH="${release_json_path}" python -c "import json, os, sys; data=json.load(open(os.environ['RELEASE_JSON_PATH'], 'r', encoding='utf-8')); assets={a.get('name') for a in data.get('assets', [])}; required={'rust_browser_handler_windows.zip','rust_browser_handler_linux.tar.gz'}; missing=required-assets; sys.stderr.write(f'Missing release assets: {sorted(missing)}\n') if missing else None; sys.exit(0 if not missing else 1)"            then
+            if RELEASE_JSON_PATH="${release_json_path}" python "${check_assets_script}"; then
               should_build="false"
             fi
           elif [[ "${http_code}" != "404" ]]; then
