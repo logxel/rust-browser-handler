@@ -1,5 +1,6 @@
 mod browser_discovery;
 mod browser_profiles;
+mod favorite;
 mod gui;
 mod platform;
 mod rules;
@@ -63,6 +64,13 @@ enum Commands {
     Doctor,
     /// Test URL handler invocation chain
     TestHandler { url: Option<String> },
+    /// Set the favorite browser shown first when choosing (by name, or
+    /// interactively when no name is given)
+    SetFavorite { browser: Option<String> },
+    /// Show the currently configured favorite browser
+    ShowFavorite,
+    /// Clear the configured favorite browser
+    ClearFavorite,
 }
 
 fn print_help() {
@@ -79,6 +87,9 @@ fn print_help() {
     println!("  open-settings: Open Windows Default Apps settings");
     println!("  doctor: Diagnose desktop URL handler resolution");
     println!("  test-handler [url]: Test URL handler invocation");
+    println!("  set-favorite [name]: Set the favorite browser (interactive if name omitted)");
+    println!("  show-favorite: Show the currently configured favorite browser");
+    println!("  clear-favorite: Clear the configured favorite browser");
     println!("  exit: Exit interactive mode");
 }
 
@@ -315,6 +326,17 @@ fn handle_command(command: Option<Commands>, url: Option<String>) {
             let test_url = url.unwrap_or_else(|| "http://example.com".to_string());
             test_handler_cmd(&test_url);
         }
+        Some(Commands::SetFavorite { browser }) => {
+            set_favorite_browser_cmd(browser);
+        }
+        Some(Commands::ShowFavorite) => {
+            show_favorite_browser_cmd();
+        }
+        Some(Commands::ClearFavorite) => match favorite::clear_favorite_browser() {
+            Ok(true) => println!("Favorite browser cleared."),
+            Ok(false) => println!("No favorite browser was set."),
+            Err(e) => error!("Failed to clear favorite browser: {}", e),
+        },
         None => {
             // No subcommand provided, but maybe a URL
             if let Some(url) = url {
@@ -341,8 +363,13 @@ fn handle_url_open(url: String) {
     let mut browsers: Vec<String> = browsers_set.into_iter().collect();
     browsers.sort();
 
-    // Float the OS-configured default browser to the top of the list so it's
-    // the first (and easiest to pick) option presented to the user.
+    // Float the OS-configured default browser to the top as a baseline
+    // ordering. In practice this rarely fires once this app is itself
+    // registered as the OS default handler (the only reason it's being
+    // asked to open a URL), since then the OS default IS this app rather
+    // than a real browser — `default_browser_path` returns `None` in that
+    // case. It still helps before registration, or if the OS default ever
+    // reports something else.
     if let Some(default_browser) = handler.default_browser_path()
         && let Some(pos) = browsers.iter().position(|b| b == &default_browser)
     {
@@ -351,7 +378,19 @@ fn handle_url_open(url: String) {
     }
     info!("Detected browsers: {:?}", browsers);
 
-    let selectable_browsers = browser_profiles::expand_with_profiles(&browsers);
+    let mut selectable_browsers = browser_profiles::expand_with_profiles(&browsers);
+
+    // The user's explicitly configured favorite always wins over the OS
+    // default ordering above, since it's a deliberate choice rather than an
+    // OS-reported guess.
+    if let Some(favorite_browser) = favorite::read_favorite_browser()
+        && let Some(pos) = selectable_browsers
+            .iter()
+            .position(|b| b == &favorite_browser)
+    {
+        let favorite_browser = selectable_browsers.remove(pos);
+        selectable_browsers.insert(0, favorite_browser);
+    }
     info!(
         "Selectable browsers (with profiles): {:?}",
         selectable_browsers
@@ -540,6 +579,91 @@ fn handle_url_open(url: String) {
     }
 }
 
+fn detect_selectable_browsers() -> Vec<String> {
+    let handler = Handler;
+    let browsers_set: std::collections::HashSet<String> =
+        handler.find_browsers().into_iter().collect();
+    let mut browsers: Vec<String> = browsers_set.into_iter().collect();
+    browsers.sort();
+    browser_profiles::expand_with_profiles(&browsers)
+}
+
+fn set_favorite_browser_cmd(browser: Option<String>) {
+    let selectable = detect_selectable_browsers();
+    if selectable.is_empty() {
+        println!("No browsers detected.");
+        return;
+    }
+
+    let chosen = match browser {
+        Some(query) => {
+            let query_lower = query.to_lowercase();
+            selectable.iter().find(|spec| {
+                spec.to_lowercase().contains(&query_lower)
+                    || browser_profiles::spec_display_name(spec)
+                        .to_lowercase()
+                        .contains(&query_lower)
+            })
+        }
+        None => {
+            if !io::stdin().is_terminal() {
+                println!(
+                    "No browser specified and no interactive terminal available. Usage: set-favorite <name>"
+                );
+                return;
+            }
+
+            println!("Detected browsers:");
+            for (i, spec) in selectable.iter().enumerate() {
+                println!("{}: {}", i + 1, browser_profiles::spec_display_name(spec));
+            }
+            print!("Select a browser number to set as favorite: ");
+            if io::stdout().flush().is_err() {
+                return;
+            }
+            let mut input = String::new();
+            if io::stdin().read_line(&mut input).is_err() {
+                return;
+            }
+            match input
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .filter(|&n| n > 0 && n <= selectable.len())
+            {
+                Some(n) => selectable.get(n - 1),
+                None => {
+                    println!("Invalid selection.");
+                    return;
+                }
+            }
+        }
+    };
+
+    match chosen {
+        Some(spec) => match favorite::write_favorite_browser(spec) {
+            Ok(_) => println!(
+                "Favorite browser set to {}.",
+                browser_profiles::spec_display_name(spec)
+            ),
+            Err(e) => error!("Failed to save favorite browser: {}", e),
+        },
+        None => println!(
+            "No detected browser matched. Use 'show-favorite' or run without an argument to pick from a list."
+        ),
+    }
+}
+
+fn show_favorite_browser_cmd() {
+    match favorite::read_favorite_browser() {
+        Some(spec) => println!(
+            "Favorite browser: {}",
+            browser_profiles::spec_display_name(&spec)
+        ),
+        None => println!("No favorite browser set."),
+    }
+}
+
 fn launch_browser_with_optional_rule(url: &str, browser_path: &str, save_rule: bool) {
     info!(
         "Launching selected browser: {} with URL: {}",
@@ -650,6 +774,16 @@ fn parse_interactive_command(input: &str) -> Result<Commands, &'static str> {
             let url = parts.get(1).map(|s| s.to_string());
             Ok(Commands::TestHandler { url })
         }
+        "set-favorite" => {
+            let browser = if parts.len() > 1 {
+                Some(parts[1..].join(" "))
+            } else {
+                None
+            };
+            Ok(Commands::SetFavorite { browser })
+        }
+        "show-favorite" => Ok(Commands::ShowFavorite),
+        "clear-favorite" => Ok(Commands::ClearFavorite),
         _ => Err("Unknown command. Type 'help' for commands."),
     }
 }
