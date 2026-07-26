@@ -1,4 +1,4 @@
-use crate::browser_discovery::get_browser_name_from_path;
+use crate::browser_profiles;
 use copypasta::{ClipboardContext, ClipboardProvider};
 use log::{error, warn};
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
@@ -241,7 +241,7 @@ pub fn prompt_browser_selection_slint(url: &str, browsers: &[String]) -> GuiChoo
 fn browser_display_names(browsers: &[String]) -> Vec<String> {
     let derived_names: Vec<String> = browsers
         .iter()
-        .map(|browser_path| get_browser_name_from_path(browser_path))
+        .map(|browser_spec| browser_profiles::spec_display_name(browser_spec))
         .collect();
 
     let mut counts: HashMap<String, usize> = HashMap::new();
@@ -252,16 +252,17 @@ fn browser_display_names(browsers: &[String]) -> Vec<String> {
     browsers
         .iter()
         .zip(derived_names)
-        .map(|(browser_path, browser_name)| {
+        .map(|(browser_spec, browser_name)| {
+            let (base_path, _) = browser_profiles::decode_browser_spec(browser_spec);
             let browser_key = browser_name.clone();
-            let mut display_name = if browser_path.starts_with("flatpak:") {
+            let mut display_name = if base_path.starts_with("flatpak:") {
                 format!("{} (Flatpak)", browser_name)
             } else {
                 browser_name
             };
 
             if counts.get(browser_key.as_str()).copied().unwrap_or(0) > 1 {
-                display_name = format!("{} ({})", display_name, browser_path);
+                display_name = format!("{} ({})", display_name, base_path);
             }
 
             truncate_display_name(&display_name)

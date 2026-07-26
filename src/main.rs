@@ -1,9 +1,9 @@
 mod browser_discovery;
+mod browser_profiles;
 mod gui;
 mod platform;
 mod rules;
 
-use browser_discovery::*;
 use clap::{Parser, Subcommand};
 use gui::{GuiChooserOutcome, prompt_browser_selection_slint};
 use log::{error, info, warn};
@@ -340,7 +340,22 @@ fn handle_url_open(url: String) {
         handler.find_browsers().into_iter().collect();
     let mut browsers: Vec<String> = browsers_set.into_iter().collect();
     browsers.sort();
+
+    // Float the OS-configured default browser to the top of the list so it's
+    // the first (and easiest to pick) option presented to the user.
+    if let Some(default_browser) = handler.default_browser_path()
+        && let Some(pos) = browsers.iter().position(|b| b == &default_browser)
+    {
+        let default_browser = browsers.remove(pos);
+        browsers.insert(0, default_browser);
+    }
     info!("Detected browsers: {:?}", browsers);
+
+    let selectable_browsers = browser_profiles::expand_with_profiles(&browsers);
+    info!(
+        "Selectable browsers (with profiles): {:?}",
+        selectable_browsers
+    );
 
     let mut matched_browser_path: Option<String> = None;
 
@@ -351,7 +366,7 @@ fn handle_url_open(url: String) {
             match Regex::new(&rule.pattern) {
                 Ok(re) => {
                     if re.is_match(&url) {
-                        matched_browser_path = browsers
+                        matched_browser_path = selectable_browsers
                             .iter()
                             .find(|browser_path: &&String| {
                                 browser_path
@@ -369,7 +384,7 @@ fn handle_url_open(url: String) {
                 }
             }
         } else if url.contains(&rule.pattern) {
-            matched_browser_path = browsers
+            matched_browser_path = selectable_browsers
                 .iter()
                 .find(|browser_path: &&String| {
                     browser_path
@@ -394,10 +409,10 @@ fn handle_url_open(url: String) {
         warn!("No rule matched for URL: {}", url);
         #[cfg(windows)]
         ensure_console_window();
-        if browsers.is_empty() {
+        if selectable_browsers.is_empty() {
             error!("No browsers detected to open the URL.");
         } else if !io::stdin().is_terminal() {
-            match prompt_browser_selection_slint(&url, &browsers) {
+            match prompt_browser_selection_slint(&url, &selectable_browsers) {
                 GuiChooserOutcome::Selected {
                     browser_path,
                     save_rule,
@@ -408,14 +423,14 @@ fn handle_url_open(url: String) {
                     info!("Browser selection cancelled.");
                 }
                 GuiChooserOutcome::Unavailable => {
-                    if let Some(browser_path) = browsers.first().cloned() {
+                    if let Some(browser_path) = selectable_browsers.first().cloned() {
                         info!(
                             "Slint chooser unavailable; launching fallback browser: {} with URL: {}",
                             browser_path, url
                         );
                         println!(
                             "No interactive terminal is available. Opening the URL in {}.",
-                            get_browser_name_from_path(&browser_path)
+                            browser_profiles::spec_display_name(&browser_path)
                         );
                         match spawn_browser_process(&browser_path, &url) {
                             Ok(_) => info!("Fallback browser launched successfully."),
@@ -427,8 +442,8 @@ fn handle_url_open(url: String) {
         } else {
             println!("URL: {}", url);
             info!("Detected browsers:");
-            for (i, browser_path) in browsers.iter().enumerate() {
-                let browser_name = get_browser_name_from_path(browser_path);
+            for (i, browser_path) in selectable_browsers.iter().enumerate() {
+                let browser_name = browser_profiles::spec_display_name(browser_path);
                 println!("{}: {}", i + 1, browser_name);
             }
 
@@ -442,7 +457,7 @@ fn handle_url_open(url: String) {
             }
             match io::stdin().read_line(&mut selection) {
                 Ok(0) => {
-                    let fallback_browser = browsers.first().cloned();
+                    let fallback_browser = selectable_browsers.first().cloned();
                     if let Some(browser_path) = fallback_browser {
                         info!(
                             "EOF received while waiting for browser selection; launching fallback browser: {} with URL: {}",
@@ -450,7 +465,7 @@ fn handle_url_open(url: String) {
                         );
                         println!(
                             "No input was received. Opening the URL in {}.",
-                            get_browser_name_from_path(&browser_path)
+                            browser_profiles::spec_display_name(&browser_path)
                         );
                         match spawn_browser_process(&browser_path, &url) {
                             Ok(_) => info!("Fallback browser launched successfully."),
@@ -478,8 +493,8 @@ fn handle_url_open(url: String) {
                 };
 
                 if let Ok(index) = selection_str.parse::<usize>() {
-                    if index > 0 && index <= browsers.len() {
-                        let selected_browser_path = &browsers[index - 1];
+                    if index > 0 && index <= selectable_browsers.len() {
+                        let selected_browser_path = &selectable_browsers[index - 1];
                         info!(
                             "Launching selected browser: {} with URL: {}",
                             selected_browser_path, url
@@ -557,15 +572,25 @@ fn launch_browser_with_optional_rule(url: &str, browser_path: &str, save_rule: b
 }
 
 fn spawn_browser_process(browser_spec: &str, url: &str) -> Result<(), std::io::Error> {
-    if let Some(app_id) = browser_spec.strip_prefix("flatpak:") {
+    let (base_path, profile_id) = browser_profiles::decode_browser_spec(browser_spec);
+    let profile_args = profile_id
+        .map(|profile_id| browser_profiles::profile_launch_args(base_path, profile_id))
+        .unwrap_or_default();
+
+    if let Some(app_id) = base_path.strip_prefix("flatpak:") {
         Command::new("flatpak")
             .arg("run")
             .arg(app_id)
+            .args(&profile_args)
             .arg(url)
             .spawn()
             .map(|_| ())
     } else {
-        Command::new(browser_spec).arg(url).spawn().map(|_| ())
+        Command::new(base_path)
+            .args(&profile_args)
+            .arg(url)
+            .spawn()
+            .map(|_| ())
     }
 }
 
