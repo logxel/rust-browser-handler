@@ -398,39 +398,43 @@ fn handle_url_open(url: String) {
 
     let mut matched_browser_path: Option<String> = None;
 
+    // Pre-compute lowercase browser names to avoid repeated allocations in the hot path
+    let browsers_lower: Vec<String> = selectable_browsers
+        .iter()
+        .map(|b| b.to_lowercase())
+        .collect();
+
     for rule in &rules {
         let is_regex = rule.is_regex.unwrap_or(false);
+        let rule_browser_lower = rule.browser.to_lowercase();
 
         if is_regex {
-            match Regex::new(&rule.pattern) {
-                Ok(re) => {
-                    if re.is_match(&url) {
-                        matched_browser_path = selectable_browsers
-                            .iter()
-                            .find(|browser_path: &&String| {
-                                browser_path
-                                    .to_lowercase()
-                                    .contains(&rule.browser.to_lowercase())
-                            })
-                            .cloned();
-                        if matched_browser_path.is_some() {
-                            break;
-                        }
+            // Use pre-compiled regex when available, fall back to compiling on the fly
+            let matched = if let Some(re) = &rule.compiled_regex {
+                re.is_match(&url)
+            } else {
+                match Regex::new(&rule.pattern) {
+                    Ok(re) => re.is_match(&url),
+                    Err(e) => {
+                        error!("Invalid regex pattern '{}': {}", rule.pattern, e);
+                        false
                     }
                 }
-                Err(e) => {
-                    error!("Invalid regex pattern '{}': {}", rule.pattern, e);
+            };
+            if matched {
+                matched_browser_path = browsers_lower
+                    .iter()
+                    .position(|bl| bl.contains(&rule_browser_lower))
+                    .map(|i| selectable_browsers[i].clone());
+                if matched_browser_path.is_some() {
+                    break;
                 }
             }
         } else if url.contains(&rule.pattern) {
-            matched_browser_path = selectable_browsers
+            matched_browser_path = browsers_lower
                 .iter()
-                .find(|browser_path: &&String| {
-                    browser_path
-                        .to_lowercase()
-                        .contains(&rule.browser.to_lowercase())
-                })
-                .cloned();
+                .position(|bl| bl.contains(&rule_browser_lower))
+                .map(|i| selectable_browsers[i].clone());
             if matched_browser_path.is_some() {
                 break;
             }
@@ -987,6 +991,21 @@ enum RegisterLocationChoice {
     UseInstalled(PathBuf),
 }
 
+fn installed_copy_is_stale(current_exe: &std::path::Path, installed_path: &std::path::Path) -> bool {
+    let installed_meta = match std::fs::metadata(installed_path) {
+        Ok(m) => m,
+        Err(_) => return true,
+    };
+    let current_meta = match std::fs::metadata(current_exe) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    match (current_meta.modified(), installed_meta.modified()) {
+        (Ok(current_time), Ok(installed_time)) => current_time > installed_time,
+        _ => false,
+    }
+}
+
 fn choose_register_location() -> Result<RegisterLocationChoice, Box<dyn std::error::Error>> {
     let current_exe = std::env::current_exe()?;
     let expected_path = best_practice_install_path()?;
@@ -995,8 +1014,26 @@ fn choose_register_location() -> Result<RegisterLocationChoice, Box<dyn std::err
         return Ok(RegisterLocationChoice::Current);
     }
 
+    let no_auto = std::env::var("RUST_BROWSER_HANDLER_NO_AUTO_INSTALL").is_ok();
+
     if !io::stdin().is_terminal() {
         println!();
+        if !no_auto {
+            let stale = installed_copy_is_stale(&current_exe, &expected_path);
+            if stale || !expected_path.exists() {
+                let action = if expected_path.exists() {
+                    "Updating"
+                } else {
+                    "Installing"
+                };
+                println!(
+                    "Non-interactive session detected. {} best-practice copy at {} and registering that copy.",
+                    action,
+                    expected_path.to_string_lossy()
+                );
+                return Ok(RegisterLocationChoice::InstallAndRegister);
+            }
+        }
         if expected_path.exists() {
             println!(
                 "Non-interactive session detected. Using the installed best-practice copy at {}.",
@@ -1012,8 +1049,24 @@ fn choose_register_location() -> Result<RegisterLocationChoice, Box<dyn std::err
         return Ok(RegisterLocationChoice::InstallAndRegister);
     }
 
+    // Interactive mode
+    let stale = installed_copy_is_stale(&current_exe, &expected_path);
+    let is_outdated = stale || !expected_path.exists();
+
     println!();
-    if expected_path.exists() {
+    if !no_auto && is_outdated {
+        if expected_path.exists() {
+            println!(
+                "The best-practice install at {} is outdated.",
+                expected_path.to_string_lossy()
+            );
+        } else {
+            println!(
+                "The best-practice install path is {}.",
+                expected_path.to_string_lossy()
+            );
+        }
+    } else if expected_path.exists() {
         println!(
             "The best-practice install already exists at {}.",
             expected_path.to_string_lossy()
@@ -1028,14 +1081,26 @@ fn choose_register_location() -> Result<RegisterLocationChoice, Box<dyn std::err
         "You are currently running {}.",
         current_exe.to_string_lossy()
     );
-    println!("1) Install to the best-practice path and register that copy");
+    if !no_auto && is_outdated {
+        println!("1) Update install and register that copy (recommended)");
+    } else {
+        println!("1) Install to the best-practice path and register that copy");
+    }
     println!("2) Use the current location and register it as-is");
-    print!("Select 1 or 2 [2]: ");
+    let default_prompt = if is_outdated && !no_auto { "[1]" } else { "[2]" };
+    print!("Select 1 or 2 {}: ", default_prompt);
     io::stdout().flush()?;
 
     let mut selection = String::new();
     let bytes_read = io::stdin().read_line(&mut selection)?;
     if bytes_read == 0 {
+        if is_outdated && !no_auto {
+            println!(
+                "No input received. Installing to the best-practice path at {} and registering that copy.",
+                expected_path.to_string_lossy()
+            );
+            return Ok(RegisterLocationChoice::InstallAndRegister);
+        }
         if expected_path.exists() {
             println!(
                 "No input received. Using the installed best-practice copy at {}.",
@@ -1095,5 +1160,61 @@ fn ensure_console_window() {
             ShowWindow(hwnd, SW_SHOW);
             SetForegroundWindow(hwnd);
         }
+    }
+}
+
+#[cfg(test)]
+mod main_tests {
+    use super::*;
+    use std::fs;
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn installed_copy_is_stale_current_newer_than_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        let installed = dir.path().join("installed");
+        let current = dir.path().join("current");
+        fs::write(&installed, b"old").unwrap();
+        thread::sleep(Duration::from_millis(1500));
+        fs::write(&current, b"new").unwrap();
+        assert!(installed_copy_is_stale(&current, &installed));
+    }
+
+    #[test]
+    fn installed_copy_is_stale_installed_newer_or_same() {
+        let dir = tempfile::tempdir().unwrap();
+        let installed = dir.path().join("installed");
+        let current = dir.path().join("current");
+        fs::write(&current, b"new").unwrap();
+        thread::sleep(Duration::from_millis(1500));
+        fs::write(&installed, b"old").unwrap();
+        assert!(!installed_copy_is_stale(&current, &installed));
+    }
+
+    #[test]
+    fn installed_copy_is_stale_installed_not_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let installed = dir.path().join("nonexistent");
+        let current = dir.path().join("current");
+        fs::write(&current, b"data").unwrap();
+        assert!(installed_copy_is_stale(&current, &installed));
+    }
+
+    #[test]
+    fn installed_copy_is_stale_current_not_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let installed = dir.path().join("installed");
+        let current = dir.path().join("nonexistent");
+        fs::write(&installed, b"data").unwrap();
+        assert!(!installed_copy_is_stale(&current, &installed));
+    }
+
+    #[test]
+    fn installed_copy_is_stale_same_file_not_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("binary");
+        fs::write(&path, b"data").unwrap();
+        assert!(!installed_copy_is_stale(&path, &path));
     }
 }

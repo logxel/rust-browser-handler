@@ -297,7 +297,7 @@ pub fn decode_browser_spec(spec: &str) -> (&str, Option<&str>) {
 /// undetectable) profile are kept as a plain-path entry, so their behavior
 /// and any existing saved rules referencing the bare path are unaffected.
 pub fn expand_with_profiles(browsers: &[String]) -> Vec<String> {
-    let mut expanded = Vec::new();
+    let mut expanded = Vec::with_capacity(browsers.len() * 2);
     for browser_path in browsers {
         let profiles = detect_profiles(browser_path);
         if profiles.len() <= 1 {

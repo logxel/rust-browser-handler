@@ -23,5 +23,15 @@ fontique = { version = "0.8.0", default-features = false, features = ["fontconfi
 winreg = "0.56.0"
 winapi = { version = "0.3.9", features = ["winuser", "wincon", "shellapi", "shlobj"] }
 
+[profile.release]
+opt-level = "z"
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
+incremental = false
+overflow-checks = false
+
 [dev-dependencies]
 tempfile = "3.27.0"

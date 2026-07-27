@@ -1,3 +1,4 @@
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::PathBuf;
@@ -7,6 +8,17 @@ pub struct Rule {
     pub pattern: String,
     pub browser: String,
     pub is_regex: Option<bool>, // Optional field to indicate if the pattern is a regex
+    #[serde(skip)]
+    pub compiled_regex: Option<Regex>,
+}
+
+impl Rule {
+    /// Pre-compile the regex pattern so it is not recompiled on every match.
+    pub fn compile_regex(&mut self) {
+        if self.is_regex.unwrap_or(false) {
+            self.compiled_regex = Regex::new(&self.pattern).ok();
+        }
+    }
 }
 
 pub fn get_rules_file_path() -> io::Result<PathBuf> {
@@ -25,7 +37,10 @@ pub fn read_rules() -> io::Result<Vec<Rule>> {
     }
     let file = std::fs::File::open(path)?;
     let reader = std::io::BufReader::new(file);
-    let rules = serde_json::from_reader(reader)?;
+    let mut rules: Vec<Rule> = serde_json::from_reader(reader)?;
+    for rule in &mut rules {
+        rule.compile_regex();
+    }
     Ok(rules)
 }
 
@@ -46,6 +61,7 @@ pub fn add_rule(pattern: String, browser: String, is_regex: bool) -> io::Result<
         pattern,
         browser,
         is_regex: Some(is_regex),
+        compiled_regex: None,
     });
     write_rules(&rules)?;
     Ok(())
@@ -145,6 +161,7 @@ mod rule_tests {
             pattern: "test.com".to_string(),
             browser: "edge".to_string(),
             is_regex: Some(true),
+            compiled_regex: None,
         }];
         let file = NamedTempFile::new().expect("Failed to create temp file");
         let path = file.path().to_str().unwrap().to_string();
@@ -247,6 +264,7 @@ mod rule_tests {
             pattern,
             browser,
             is_regex: Some(is_regex),
+            compiled_regex: None,
         });
         write_rules_to_path(&rules, path)?;
         Ok(())

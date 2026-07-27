@@ -25,8 +25,10 @@ Download the appropriate release for your platform from the [GitHub Releases](ht
 
 ### Linux
 1. Download `rust_browser_handler_linux.tar.gz`
-2. **Extract to a permanent location** (recommended: `~/bin/` or `/usr/local/bin/`)
+2. **Extract to a permanent location** (recommended: `~/.local/bin/` or `/usr/local/bin/`)
 3. Execute `./rust_browser_handler register` to register as the default browser handler
+   - If run from a non-installed location, the app automatically installs (or updates) itself to `~/.local/bin/` before registering
+   - Set `RUST_BROWSER_HANDLER_NO_AUTO_INSTALL` to any value to opt out of auto-install
 4. The application will integrate with your desktop environment using XDG standards
 
 **Important:** Always place the executable in a permanent location before registering, as the system integration (registry entries on Windows, .desktop files on Linux) will reference that specific path.
@@ -151,12 +153,11 @@ This performs full registry integration to become the system default browser han
 On Linux systems, registration uses XDG standards for cross-desktop compatibility:
 
 ```bash
-# First, place the executable in a permanent location (recommended: ~/bin/ or /usr/local/bin/)
-# Then register it as the default handler
+# register auto-installs to ~/.local/bin/ if run from elsewhere (unless RUST_BROWSER_HANDLER_NO_AUTO_INSTALL is set)
 ./rust_browser_handler register
 ```
 
-To install to a best-practice Linux user path first:
+To install to a best-practice Linux user path manually:
 
 ```bash
 # Run from your current extracted/build location
@@ -169,7 +170,7 @@ rust_browser_handler register
 rust_browser_handler uninstall
 ```
 
-**Important:** Place the executable in a permanent location before registering, as the `.desktop` file will reference that specific path.
+**Note:** The `register` command auto-installs (or updates) itself to `~/.local/bin/` before registering when run from a non-best-practice location. Set `RUST_BROWSER_HANDLER_NO_AUTO_INSTALL` to any value to disable this behavior and fall back to interactive prompting.
 
 This creates a `.desktop` file in `~/.local/share/applications/` and uses `xdg-mime` to associate the application with HTTP and HTTPS URL schemes. This works across desktop environments (GNOME, KDE, XFCE, COSMIC, etc.) that follow freedesktop.org standards.
 
@@ -191,7 +192,7 @@ If COSMIC or GNOME Settings UI does not immediately show the app in Default Appl
 
 Alternatively, you can run the executable without arguments to enter interactive mode and use the `register` command there.
 
-If you run `register` from a non-installed binary, the app will prompt you to either install to the best-practice location first and register that copy, or register the current location as-is. Use `unregister` separately if you want to clear the browser association.
+If you run `register` from a non-installed binary, the app automatically installs (or updates) itself to `~/.local/bin/` before registering, unless `RUST_BROWSER_HANDLER_NO_AUTO_INSTALL` is set. Use `unregister` separately if you want to clear the browser association.
 
 ### Rule Management
 

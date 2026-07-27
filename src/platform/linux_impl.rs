@@ -1,13 +1,18 @@
 use super::PlatformHandler;
-use log::warn;
+use log::{info, warn};
 use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::io::ErrorKind;
 use std::path::Path;
 use std::process::{Command, Output};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 pub struct LinuxHandler;
+
+static BROWSER_CACHE: Mutex<Option<(Vec<String>, Instant)>> = Mutex::new(None);
+const CACHE_TTL: Duration = Duration::from_secs(300);
 
 fn render_desktop_entry(exe_path: &str) -> String {
     include_str!("../../packaging/desktop/rust-browser-handler.desktop.in")
@@ -106,6 +111,116 @@ fn cleanup_mimeapps_defaults(desktop_id: &str) -> io::Result<bool> {
     }
 
     Ok(changed_any)
+}
+
+/// Parse `mimeapps.list` content and set (or replace) `x-scheme-handler/http`
+/// and `x-scheme-handler/https` entries inside the `[Default Applications]`
+/// section, preserving all other sections and entries intact.
+/// If no `[Default Applications]` section exists, one is appended.
+fn set_mime_default_entries(contents: &str, desktop_id: &str) -> String {
+    let mut in_default_applications = false;
+    let mut http_found = false;
+    let mut https_found = false;
+    let mut output: Vec<String> = Vec::new();
+
+    for line in contents.lines() {
+        let trimmed = line.trim();
+
+        if trimmed.starts_with('[') && trimmed.ends_with(']') && trimmed.len() > 2 {
+            // Leaving the [Default Applications] section: insert any missing entries.
+            if in_default_applications && (!http_found || !https_found) {
+                if !http_found {
+                    output.push(format!("x-scheme-handler/http={}", desktop_id));
+                    http_found = true;
+                }
+                if !https_found {
+                    output.push(format!("x-scheme-handler/https={}", desktop_id));
+                    https_found = true;
+                }
+            }
+
+            let section_name = &trimmed[1..trimmed.len() - 1];
+            in_default_applications =
+                section_name == "Default Applications" || section_name == "DefaultApplications";
+            output.push(line.to_string());
+            continue;
+        }
+
+        if in_default_applications {
+            if let Some((key, _)) = line.split_once('=') {
+                let key = key.trim();
+                if key == "x-scheme-handler/http" {
+                    output.push(format!("x-scheme-handler/http={}", desktop_id));
+                    http_found = true;
+                    continue;
+                }
+                if key == "x-scheme-handler/https" {
+                    output.push(format!("x-scheme-handler/https={}", desktop_id));
+                    https_found = true;
+                    continue;
+                }
+            }
+        }
+
+        output.push(line.to_string());
+    }
+
+    // At EOF: if still inside [Default Applications], append missing entries.
+    if in_default_applications && (!http_found || !https_found) {
+        if !http_found {
+            output.push(format!("x-scheme-handler/http={}", desktop_id));
+        }
+        if !https_found {
+            output.push(format!("x-scheme-handler/https={}", desktop_id));
+        }
+    }
+
+    // No [Default Applications] section was found: add one at the end.
+    if !output.iter().any(|l| {
+        let t = l.trim();
+        (t.starts_with("[Default Applications]") || t.starts_with("[DefaultApplications]"))
+            && t.ends_with(']')
+    }) {
+        if !output.is_empty() && !output.last().map_or(true, |l| l.is_empty()) {
+            output.push(String::new());
+        }
+        output.push("[Default Applications]".to_string());
+        output.push(format!("x-scheme-handler/http={}", desktop_id));
+        output.push(format!("x-scheme-handler/https={}", desktop_id));
+    }
+
+    let mut result = output.join("\n");
+    if contents.ends_with('\n') {
+        result.push('\n');
+    }
+    result
+}
+
+/// Directly write `[Default Applications]` entries for HTTP and HTTPS
+/// scheme handlers into `~/.config/mimeapps.list`.  This is the primary
+/// registration mechanism — it avoids GLib-GIO warnings on COSMIC and
+/// other DEs that forbid anything but `[Default Applications]` in
+/// desktop-specific mimeapps files.
+fn write_mime_defaults(desktop_id: &str) -> io::Result<()> {
+    let config_dir = dirs::config_dir()
+        .ok_or_else(|| io::Error::other("Could not find config directory"))?;
+    fs::create_dir_all(&config_dir)?;
+
+    let mimeapps_path = config_dir.join("mimeapps.list");
+
+    let contents = if mimeapps_path.exists() {
+        fs::read_to_string(&mimeapps_path)?
+    } else {
+        String::new()
+    };
+
+    let updated = set_mime_default_entries(&contents, desktop_id);
+
+    if updated != contents {
+        fs::write(&mimeapps_path, &updated)?;
+    }
+
+    Ok(())
 }
 
 fn is_flatpak_browser_id(app_id: &str) -> bool {
@@ -257,6 +372,15 @@ fn detect_system_mimeapps_references(desktop_id: &str) -> Vec<String> {
 
 impl PlatformHandler for LinuxHandler {
     fn find_browsers(&self) -> Vec<String> {
+        // Check cache first
+        if let Ok(guard) = BROWSER_CACHE.lock() {
+            if let Some((ref cached, timestamp)) = *guard {
+                if timestamp.elapsed() < CACHE_TTL {
+                    return cached.clone();
+                }
+            }
+        }
+
         let mut browsers = HashSet::new();
 
         // Common browsers to check
@@ -343,6 +467,13 @@ impl PlatformHandler for LinuxHandler {
             }
         }
 
+        let deduped = deduped;
+
+        // Update cache
+        if let Ok(mut guard) = BROWSER_CACHE.lock() {
+            *guard = Some((deduped.clone(), Instant::now()));
+        }
+
         deduped
     }
 
@@ -387,7 +518,25 @@ impl PlatformHandler for LinuxHandler {
             _ => {}
         }
 
-        // Set MIME type associations using xdg-mime
+        // Primary: write MIME defaults directly into mimeapps.list.
+        // This avoids GLib-GIO warnings on COSMIC and other DEs that
+        // restrict desktop-specific mimeapps files to [Default Applications].
+        match write_mime_defaults("rust-browser-handler.desktop") {
+            Ok(()) => {
+                info!(
+                    "Set HTTP/HTTPS defaults in mimeapps.list (primary registration)."
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "Could not write MIME defaults directly to mimeapps.list: {}.
+                    Falling back to xdg-mime.",
+                    e
+                );
+            }
+        }
+
+        // Set MIME type associations using xdg-mime (fallback)
         let http_status = Command::new("xdg-mime")
             .args([
                 "default",
@@ -406,23 +555,7 @@ impl PlatformHandler for LinuxHandler {
 
         match (http_status, https_status) {
             (Ok(http), Ok(https)) if http.status.success() && https.status.success() => {
-                // Best-effort for environments that consult gio MIME defaults.
-                let _ = Command::new("gio")
-                    .args([
-                        "mime",
-                        "x-scheme-handler/http",
-                        "rust-browser-handler.desktop",
-                    ])
-                    .status();
-                let _ = Command::new("gio")
-                    .args([
-                        "mime",
-                        "x-scheme-handler/https",
-                        "rust-browser-handler.desktop",
-                    ])
-                    .status();
-
-                // Best-effort for environments that prefer xdg-settings.
+                // Set default web browser via xdg-settings for DE integration.
                 let xdg_settings_set = Command::new("xdg-settings")
                     .args(["set", "default-web-browser", "rust-browser-handler.desktop"])
                     .output();
@@ -675,7 +808,9 @@ impl PlatformHandler for LinuxHandler {
 mod tests {
     use super::{
         parse_flatpak_browser_list, purge_desktop_entry_from_mimeapps, render_desktop_entry,
+        set_mime_default_entries, write_mime_defaults,
     };
+    use std::fs;
 
     #[test]
     fn desktop_entry_uses_unquoted_exec_path() {
@@ -719,5 +854,145 @@ mod tests {
 
         assert!(output.contains("[Added Associations]"));
         assert!(output.contains("x-scheme-handler/http="));
+    }
+
+    #[test]
+    fn set_mime_defaults_creates_section_when_no_file() {
+        let output = set_mime_default_entries("", "rust-browser-handler.desktop");
+        assert!(output.contains("[Default Applications]"));
+        assert!(output.contains("x-scheme-handler/http=rust-browser-handler.desktop"));
+        assert!(output.contains("x-scheme-handler/https=rust-browser-handler.desktop"));
+    }
+
+    #[test]
+    fn set_mime_defaults_updates_existing_entries() {
+        let input = "[Default Applications]\nx-scheme-handler/http=firefox.desktop\nx-scheme-handler/https=firefox.desktop\ntext/html=firefox.desktop\n";
+        let output = set_mime_default_entries(input, "rust-browser-handler.desktop");
+        assert!(output.contains("x-scheme-handler/http=rust-browser-handler.desktop"));
+        assert!(output.contains("x-scheme-handler/https=rust-browser-handler.desktop"));
+        assert!(output.contains("text/html=firefox.desktop"));
+        assert!(!output.contains("firefox.desktop\nx-scheme-handler/http"));
+        assert!(!output.contains("firefox.desktop\nx-scheme-handler/https"));
+    }
+
+    #[test]
+    fn set_mime_defaults_preserves_other_sections() {
+        let input = "[Default Applications]\nx-scheme-handler/http=firefox.desktop\n\n[Added Associations]\ntext/html=firefox.desktop;chromium.desktop;\n";
+        let output = set_mime_default_entries(input, "rust-browser-handler.desktop");
+        assert!(output.contains("[Added Associations]"));
+        assert!(output.contains("text/html=firefox.desktop;chromium.desktop;"));
+        assert!(output.contains("x-scheme-handler/http=rust-browser-handler.desktop"));
+    }
+
+    #[test]
+    fn set_mime_defaults_adds_section_when_none_exists() {
+        let input = "[Added Associations]\ntext/html=firefox.desktop;\n";
+        let output = set_mime_default_entries(input, "rust-browser-handler.desktop");
+        // [Default Applications] section appears, with entries
+        let default_idx = output.find("[Default Applications]").unwrap();
+        assert!(output[default_idx..].contains("x-scheme-handler/http=rust-browser-handler.desktop"));
+        assert!(output[default_idx..].contains("x-scheme-handler/https=rust-browser-handler.desktop"));
+        // Original section preserved
+        assert!(output.contains("[Added Associations]"));
+        assert!(output.contains("text/html=firefox.desktop;"));
+    }
+
+    #[test]
+    fn set_mime_defaults_adds_missing_entries_to_existing_section() {
+        let input = "[Default Applications]\ntext/html=firefox.desktop\n\n[Added Associations]\nx-scheme-handler/http=firefox.desktop;\n";
+        let output = set_mime_default_entries(input, "rust-browser-handler.desktop");
+        // Both entries should be present in [Default Applications]
+        assert!(output.contains("x-scheme-handler/http=rust-browser-handler.desktop"));
+        assert!(output.contains("x-scheme-handler/https=rust-browser-handler.desktop"));
+        // [Added Associations] untouched
+        assert!(output.contains("[Added Associations]"));
+        assert!(output.contains("x-scheme-handler/http=firefox.desktop;"));
+    }
+
+    #[test]
+    fn set_mime_defaults_handles_trailing_newline() {
+        let input = "[Default Applications]\nx-scheme-handler/http=firefox.desktop\n";
+        let output = set_mime_default_entries(input, "rust-browser-handler.desktop");
+        assert!(output.ends_with('\n'));
+    }
+
+    #[test]
+    fn set_mime_defaults_handles_defaultapplications_variant() {
+        let input = "[DefaultApplications]\nx-scheme-handler/http=firefox.desktop\n";
+        let output = set_mime_default_entries(input, "rust-browser-handler.desktop");
+        assert!(output.contains("[DefaultApplications]"));
+        assert!(output.contains("x-scheme-handler/http=rust-browser-handler.desktop"));
+    }
+
+    #[test]
+    fn set_mime_defaults_idempotent() {
+        let input = "[Default Applications]\nx-scheme-handler/http=rust-browser-handler.desktop\nx-scheme-handler/https=rust-browser-handler.desktop\n";
+        let output = set_mime_default_entries(input, "rust-browser-handler.desktop");
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn write_mime_defaults_creates_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mimeapps = dir.path().join("mimeapps.list");
+        assert!(!mimeapps.exists());
+
+        // Override HOME so dirs::config_dir() resolves to our temp dir.
+        // dirs v6 uses XDG_CONFIG_HOME; if unset it falls back to
+        // $HOME/.config.
+        let saved_home = std::env::var("HOME").ok();
+        let home = dir.path().to_str().unwrap();
+        unsafe { std::env::set_var("HOME", home) };
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+
+        // run the function
+        let result = write_mime_defaults("rust-browser-handler.desktop");
+
+        // restore env
+        if let Some(prev) = saved_home {
+            unsafe { std::env::set_var("HOME", prev) };
+        } else {
+            unsafe { std::env::remove_var("HOME") };
+        }
+
+        assert!(result.is_ok());
+        let config_dir = dirs::config_dir().unwrap();
+        let written = config_dir.join("mimeapps.list");
+        assert!(written.exists());
+        let contents = fs::read_to_string(&written).unwrap();
+        assert!(contents.contains("[Default Applications]"));
+        assert!(contents.contains("x-scheme-handler/http=rust-browser-handler.desktop"));
+        assert!(contents.contains("x-scheme-handler/https=rust-browser-handler.desktop"));
+    }
+
+    #[test]
+    fn write_mime_defaults_updates_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join(".config");
+        fs::create_dir_all(&config_dir).unwrap();
+        let mimeapps = config_dir.join("mimeapps.list");
+        fs::write(
+            &mimeapps,
+            "[Default Applications]\nx-scheme-handler/http=firefox.desktop\nx-scheme-handler/https=firefox.desktop\n",
+        )
+        .unwrap();
+
+        let saved_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", dir.path().to_str().unwrap()) };
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+
+        let result = write_mime_defaults("rust-browser-handler.desktop");
+
+        if let Some(prev) = saved_home {
+            unsafe { std::env::set_var("HOME", prev) };
+        } else {
+            unsafe { std::env::remove_var("HOME") };
+        }
+
+        assert!(result.is_ok());
+        let contents = fs::read_to_string(&mimeapps).unwrap();
+        assert!(contents.contains("x-scheme-handler/http=rust-browser-handler.desktop"));
+        assert!(contents.contains("x-scheme-handler/https=rust-browser-handler.desktop"));
+        assert!(!contents.contains("firefox.desktop"));
     }
 }
